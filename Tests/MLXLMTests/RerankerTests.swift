@@ -587,6 +587,61 @@ struct RerankerTests {
         #expect(scores.allSatisfy { $0 >= 0 && $0 <= 1 })
     }
 
+    @Test func causalBatchedScoringUsesLastPositionLogitsWhenAvailable() async throws {
+        let tokenizer = ByteRerankerTokenizer()
+        let fullModel = TestCausalRerankerModel(
+            trueTokenID: tokenizer.trueTokenID,
+            falseTokenID: tokenizer.falseTokenID)
+        let lastPositionModel = TestLastPositionCausalRerankerModel(
+            trueTokenID: tokenizer.trueTokenID,
+            falseTokenID: tokenizer.falseTokenID)
+        let documents = ["a", "bbbb", "cc", "ddd", "e"]
+        let options = RerankExecutionOptions(maxBatchSize: 2, maxBatchTokens: 4_096)
+
+        let expected = try await makeModelContainer(model: fullModel, tokenizer: tokenizer)
+            .causalRerankerScores(
+                query: "q", documents: documents, instruction: nil,
+                maxInputTokens: 8_192, options: options)
+        let scores = try await makeModelContainer(
+            model: lastPositionModel, tokenizer: tokenizer
+        ).causalRerankerScores(
+            query: "q", documents: documents, instruction: nil,
+            maxInputTokens: 8_192, options: options)
+
+        #expect(scores == expected)
+        // Two batches of two go through the gather path; the singleton still prefills
+        // with the KV cache and reads the next-token logits.
+        #expect(lastPositionModel.lastPositionCalls.count == 2)
+        #expect(lastPositionModel.lastPositionCalls.allSatisfy { $0.count == 2 })
+        #expect(lastPositionModel.callShapes.map(\.first) == [1])
+    }
+
+    @Test func qwen3LastPositionLogitsMatchFullForwardPass() throws {
+        for tied in [true, false] {
+            let configuration = try JSONDecoder().decode(
+                MLXLLM.Qwen3Configuration.self,
+                from: qwen3CausalConfigurationData(tieWordEmbeddings: tied))
+            let model = Qwen3Model(configuration)
+            let tokens = MLXArray((0 ..< 15).map { Int32($0 * 7 % 128) }).reshaped(3, 5)
+            let positions = [4, 1, 3]
+
+            let full = model(tokens, cache: nil)
+            let gathered = model.logits(tokens: tokens, atPositions: positions)
+            eval(full, gathered)
+
+            #expect(full.shape == [3, 5, 128])
+            #expect(gathered.shape == [3, 128])
+            for (row, position) in positions.enumerated() {
+                let expected = full[row, position].asArray(Float.self)
+                let actual = gathered[row].asArray(Float.self)
+                #expect(expected.count == actual.count)
+                #expect(
+                    zip(expected, actual).allSatisfy { abs($0 - $1) <= 1e-4 },
+                    "row \(row) at position \(position) (tied: \(tied))")
+            }
+        }
+    }
+
     @Test func causalTokenBudgetTruncatesOversizedSingleton() async throws {
         let tokenizer = ByteRerankerTokenizer()
         let model = TestCausalRerankerModel(
@@ -753,6 +808,25 @@ private func decodeBertConfiguration(
 private func decodeQwenConfiguration() throws -> MLXLLM.Qwen3Configuration {
     try JSONDecoder().decode(
         MLXLLM.Qwen3Configuration.self, from: jinaConfigurationData())
+}
+
+private func qwen3CausalConfigurationData(tieWordEmbeddings: Bool) throws -> Data {
+    Data(
+        """
+        {
+          "model_type": "qwen3",
+          "architectures": ["Qwen3ForCausalLM"],
+          "vocab_size": 128,
+          "hidden_size": 8,
+          "num_hidden_layers": 2,
+          "intermediate_size": 16,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 4,
+          "rms_norm_eps": 1e-6,
+          "tie_word_embeddings": \(tieWordEmbeddings)
+        }
+        """.utf8)
 }
 
 private func jinaConfigurationData() throws -> Data {
@@ -957,7 +1031,7 @@ private final class TestEncoderRerankerModel: Module, RerankerModel, @unchecked 
     }
 }
 
-private final class TestCausalRerankerModel: Module, LanguageModel, ListwiseRerankerModel,
+private class TestCausalRerankerModel: Module, LanguageModel, ListwiseRerankerModel,
     @unchecked Sendable
 {
     let trueTokenID: Int
@@ -1016,6 +1090,25 @@ private final class TestCausalRerankerModel: Module, LanguageModel, ListwiseRera
     func score(input: RerankerInput, documentCount: Int) throws -> [Double] {
         listwiseTokenCount = input.tokenIds.count
         return Array(repeating: 0.5, count: documentCount)
+    }
+}
+
+/// The causal stub plus the gather path, derived from the same full logits so both paths
+/// must agree exactly.
+private final class TestLastPositionCausalRerankerModel: TestCausalRerankerModel,
+    LastPositionLogitsModel
+{
+    var lastPositionCalls = [[Int]]()
+
+    func logits(tokens: MLXArray, atPositions positions: [Int]) -> MLXArray {
+        lastPositionCalls.append(positions)
+        let full = callAsFunction(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits
+        let rows = MLXArray(Array(Int32(0) ..< Int32(positions.count)))
+        let selected = full[rows, MLXArray(positions.map { Int32($0) })]
+        // Consume this call so `callShapes` only reflects the full-logits path.
+        callShapes.removeLast()
+        callCount -= 1
+        return selected
     }
 }
 

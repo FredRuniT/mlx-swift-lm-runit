@@ -482,6 +482,24 @@ package protocol ListwiseRerankerModel: BaseLanguageModel {
     func score(input: RerankerInput, documentCount: Int) throws -> [Double]
 }
 
+/// Causal language models that can project only selected positions through the output head.
+///
+/// The batched causal reranker reads one position per document, so materializing the full
+/// `[batch, sequence, vocabulary]` logits wastes memory in proportion to the sequence length
+/// and vocabulary: for Qwen3 (`vocabularySize == 151_669`) a batch of 13 documents of 512
+/// tokens allocates about 2.4 GB of float32 logits of which 13 rows are used. A model that
+/// conforms returns only the rows the reranker needs.
+public protocol LastPositionLogitsModel: BaseLanguageModel {
+    /// Logits for one position of each batch row.
+    ///
+    /// - Parameters:
+    ///   - tokens: A `[batch, sequence]` array of token identifiers, right padded.
+    ///   - positions: One index per batch row, typically the row's last real token.
+    /// - Returns: Logits of shape `[batch, vocabulary]`, numerically identical to
+    ///   `logits[row, positions[row]]` of the full forward pass.
+    func logits(tokens: MLXArray, atPositions positions: [Int]) -> MLXArray
+}
+
 /// Applies a final scalar transform to a reranker logit or logit margin.
 ///
 /// Use ``identity`` when the model already returns calibrated scores, probabilities, or
@@ -1053,6 +1071,18 @@ private struct CausalLMReranker {
                 count: maxLength - document.input.tokenIds.count)
         }
         let tokens = MLXArray(inputIDs).reshaped(batch.count, maxLength)
+        if let model = model as? any LastPositionLogitsModel {
+            // Project only the last real token of each row through the output head:
+            // [batch, vocabulary] instead of [batch, maxLength, vocabulary].
+            let logits = model.logits(
+                tokens: tokens,
+                atPositions: batch.map { $0.input.tokenIds.count - 1 })
+            MLX.eval(logits)
+            return batch.indices.map { row in
+                probability(logits: logits[row], tokens: classifierTokens)
+            }
+        }
+
         let logits = model(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits
         let scores = batch.enumerated().map { row, document in
             probability(

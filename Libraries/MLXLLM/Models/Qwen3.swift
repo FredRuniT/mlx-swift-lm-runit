@@ -184,13 +184,15 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        projectToVocabulary(model(inputs, cache: cache))
+    }
+
+    /// Applies `lm_head`, or the tied input embeddings, to hidden states.
+    private func projectToVocabulary(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
-            out = lmHead(out)
-        } else {
-            out = model.embedTokens.asLinear(out)
+            return lmHead(hidden)
         }
-        return out
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -200,6 +202,16 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         return weights
+    }
+}
+
+extension Qwen3Model: LastPositionLogitsModel {
+    public func logits(tokens: MLXArray, atPositions positions: [Int]) -> MLXArray {
+        let hidden = model(tokens, cache: nil)
+        let rows = MLXArray(Array(Int32(0) ..< Int32(positions.count)))
+        // Gather one hidden vector per row before the output head: [batch, hidden].
+        let selected = hidden[rows, MLXArray(positions.map { Int32($0) })]
+        return projectToVocabulary(selected)
     }
 }
 
