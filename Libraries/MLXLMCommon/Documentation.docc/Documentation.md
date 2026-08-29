@@ -23,6 +23,7 @@ Common language model code.
 - ``RerankTruncationPolicy``
 - ``RerankScoreKind``
 - ``RerankerError``
+- ``LastPositionLogitsModel``
 
 ## Other MLX Libraries Packages
 
